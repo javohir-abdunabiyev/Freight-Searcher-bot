@@ -55,7 +55,7 @@ async def main():
     )
 
     # Запускаем веб-сервер в фоновом режиме для Render
-    async asyncio.create_task(start_web_server())
+    asyncio.create_task(start_web_server())
 
     await init_db()
     client = await start_telegram_client()
