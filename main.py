@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import sys
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -19,6 +21,23 @@ from config import BOT_TOKEN
 from database import init_db
 
 
+# Простейший веб-сервер для Render, чтобы он видел открытый порт и не усыплял бота
+async def handle(request):
+    return web.Response(text="Bot is alive and working 24/7!")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes([web.get("/", handle)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"🌐 Встроенный веб-сервер успешно запущен на порту {port}")
+
+
 async def set_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота"),
@@ -34,6 +53,9 @@ async def main():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         stream=sys.stdout
     )
+
+    # Запускаем веб-сервер в фоновом режиме для Render
+    async asyncio.create_task(start_web_server())
 
     await init_db()
     client = await start_telegram_client()
