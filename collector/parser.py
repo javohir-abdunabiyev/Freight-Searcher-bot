@@ -2,26 +2,22 @@ import asyncio
 import re
 import unicodedata
 from datetime import datetime, timedelta
-from sqlalchemy import select, func
+from sqlalchemy import select
 from database.session import AsyncSessionLocal
 from models.message import CargoMessage
 from telethon import events
 
-# Глобальный словарь статистики для админ-панели
 collector_stats = {
     "total_groups": 0,
-    "current_group_index": 0,
     "current_group": "Инициализация...",
-    "current_group_saved": 0,
+    "current_group_index": 0,
+    "new_caught": 0,
+    "live_caught": 0,
     "duplicates_filtered": 0,
-    "new_caught": 0,       # За исторический сбор
-    "live_caught": 0,      # Поймано строго в режиме Live
-    "deleted_from_db": 0,  # Удалено из базы (протухшие/истекшие)
     "status": "Запуск..."
 }
 
 def clean_text_for_dedup(text: str) -> str:
-    """Мягкая нормализация: убирает лишние пробелы и приводит к нижнему регистру"""
     if not text:
         return ""
     text = unicodedata.normalize('NFKD', text)
@@ -30,178 +26,148 @@ def clean_text_for_dedup(text: str) -> str:
 async def get_folder_channels(client):
     from telethon.tl.functions.messages import GetDialogFiltersRequest
     channels = []
-    target_folder = None
-    
     try:
         result = await client(GetDialogFiltersRequest())
-        filters = list(result.filters)
-        
-        for f in filters:
+        for f in result.filters:
             raw_title = getattr(f, 'title', '')
             title = str(raw_title.text if hasattr(raw_title, 'text') else raw_title).lower()
-            if any(keyword in title for keyword in ['груз', 'cargo', 'доставка', 'транспорт', 'логистик']):
-                target_folder = f
+            if any(kw in title for kw in ['груз', 'cargo', 'доставка', 'транспорт', 'логистик']):
+                for peer in f.include_peers:
+                    try:
+                        entity = await client.get_entity(peer)
+                        channels.append(entity)
+                    except Exception:
+                        pass
                 break
-                
-        if not target_folder and len(filters) > 0:
-            target_folder = filters[0]
-
-        if target_folder:
-            for peer in target_folder.include_peers:
+        if not channels and result.filters:
+            for peer in result.filters[0].include_peers:
                 try:
                     entity = await client.get_entity(peer)
                     channels.append(entity)
                 except Exception:
                     pass
     except Exception as e:
-        print(f"⚠️ Ошибка при запросе папок Telethon: {e}")
-        
+        print(f"⚠️ Ошибка получения папки: {e}")
     return channels
 
-async def run_collector_loop(client, channels_list=None):
+async def run_collector_loop(client):
     global collector_stats
     collector_stats["status"] = "Подключение к Telegram..."
     
     while client is None:
         await asyncio.sleep(2)
         
-    while True:
-        try:
-            collector_stats["status"] = "Поиск рабочей папки..."
-            target_channels = await get_folder_channels(client)
-            
-            if not target_channels:
-                collector_stats["status"] = "Папка пуста или не найдена!"
-                await asyncio.sleep(60)
-                continue
+    collector_stats["status"] = "Поиск рабочей папки..."
+    channels = await get_folder_channels(client)
+    
+    if not channels:
+        collector_stats["status"] = "Папка не найдена!"
+        return
 
-            target_chat_ids = [chat.id for chat in target_channels]
-            total_len = len(target_channels)
-            collector_stats["total_groups"] = total_len
-            collector_stats["status"] = "Исторический сбор за 48 часов (до 5000 сооб.)"
-            collector_stats["new_caught"] = 0
-            collector_stats["live_caught"] = 0
-            
-            time_limit = datetime.utcnow() - timedelta(hours=48)
-            cycle_new_count = 0
-            
-            # Оперативный кэш точных текстов для надежного отсечения дублей в текущем цикле
-            seen_exact_texts = set()
-            
-            # 1. Исторический сбор по всем группам (до 5000 сообщений или до 48 часов)
-            for idx, entity in enumerate(target_channels, start=1):
-                collector_stats["current_group_index"] = idx
+    target_chat_ids = [chat.id for chat in channels]
+    collector_stats["total_groups"] = len(channels)
+    
+    # --- ЭТАП 1: Однократный исторический сбор за 48 часов (лимит 3000 сообщений) ---
+    collector_stats["status"] = "Исторический сбор за 48 часов..."
+    time_limit = datetime.utcnow() - timedelta(hours=48)
+    history_count = 0
+    
+    seen_exact_texts = set()
+    
+    for idx, entity in enumerate(channels, start=1):
+        collector_stats["current_group_index"] = idx
+        raw_title = getattr(entity, 'title', str(getattr(entity, 'username', entity.id)))
+        group_name = str(raw_title.text if hasattr(raw_title, 'text') else raw_title)
+        collector_stats["current_group"] = f"[{idx}/{len(channels)}] {group_name}"
+        
+        try:
+            async for message in client.iter_messages(entity, limit=3000):
+                if not message.date or not message.text:
+                    continue
                 
-                raw_title = getattr(entity, 'title', str(getattr(entity, 'username', entity.id)))
-                group_name = str(raw_title.text if hasattr(raw_title, 'text') else raw_title)
+                msg_date_naive = message.date.replace(tzinfo=None)
+                if msg_date_naive < time_limit:
+                    break  # Прошли порог 48 часов, идем к следующему чату
+                    
+                text_raw = message.text.strip()
+                text_normalized = clean_text_for_dedup(text_raw)
                 
-                collector_stats["current_group"] = f"[{idx}/{total_len}] {group_name}"
-                collector_stats["current_group_saved"] = 0
-                
-                try:
-                    # Ограничиваем исторический проход до 5000 сообщений на чат
-                    async for message in client.iter_messages(entity, limit=5000):
-                        if not message.date or not message.text:
-                            continue
-                        
-                        msg_date_naive = message.date.replace(tzinfo=None)
-                        if msg_date_naive < time_limit:
-                            break  # Дошли до сообщений старше 48 часов — переходим к следующему чату
-                            
-                        text_raw = message.text.strip()
-                        text_normalized = clean_text_for_dedup(text_raw)
-                        
-                        if len(text_normalized) < 5:
-                            continue
-                            
-                        # Проверка 1: Если этот же текст уже встречался в этом цикле сбора
-                        if text_normalized in seen_exact_texts:
-                            collector_stats["duplicates_filtered"] += 1
-                            continue
-                            
-                        async with AsyncSessionLocal() as session:
-                            # Проверка 2: По ID чата и сообщения в базе данных
-                            stmt_id = select(CargoMessage).where(
-                                (CargoMessage.chat_id == message.chat_id) & (CargoMessage.message_id == message.id)
-                            )
-                            existing = (await session.execute(stmt_id)).scalars().first()
-                            
-                            if existing:
-                                collector_stats["duplicates_filtered"] += 1
-                                continue
-                                
-                            # Фиксируем в оперативном кэше цикла
-                            seen_exact_texts.add(text_normalized)
-                            
-                            new_cargo = CargoMessage(
-                                chat_id=message.chat_id,
-                                message_id=message.id,
-                                text=text_raw,
-                                message_date=msg_date_naive
-                            )
-                            session.add(new_cargo)
-                            await session.commit()
-                            
-                            collector_stats["current_group_saved"] += 1
-                            cycle_new_count += 1
-                            collector_stats["new_caught"] = cycle_new_count
-                            
-                except Exception as ex:
-                    print(f"⚠️ Ошибка чтения чата {group_name}: {ex}")
+                if len(text_normalized) < 5:
                     continue
                     
-            # 2. Переходим в непрерывный режим Live (реальное время)
-            collector_stats["status"] = "Мониторинг в реальном времени (Live)"
-            collector_stats["current_group"] = "Папка «Грузы» (слушаем поток)"
-            
-            @client.on(events.NewMessage(chats=target_chat_ids))
-            async def live_message_handler(event):
-                try:
-                    message = event.message
-                    if not message.date or not message.text:
-                        return
-                        
-                    msg_date_naive = message.date.replace(tzinfo=None)
-                    text_raw = message.text.strip()
-                    text_normalized = clean_text_for_dedup(text_raw)
+                if text_normalized in seen_exact_texts:
+                    collector_stats["duplicates_filtered"] += 1
+                    continue
                     
-                    if len(text_normalized) < 5:
-                        return
+                async with AsyncSessionLocal() as session:
+                    stmt_id = select(CargoMessage).where(
+                        (CargoMessage.chat_id == message.chat_id) & (CargoMessage.message_id == message.id)
+                    )
+                    existing = (await session.execute(stmt_id)).scalars().first()
+                    
+                    if existing:
+                        collector_stats["duplicates_filtered"] += 1
+                        continue
                         
-                    async with AsyncSessionLocal() as session:
-                        stmt_id = select(CargoMessage).where(
-                            (CargoMessage.chat_id == message.chat_id) & (CargoMessage.message_id == message.id)
-                        )
-                        existing = (await session.execute(stmt_id)).scalars().first()
-                        
-                        if existing:
-                            collector_stats["duplicates_filtered"] += 1
-                            return
-                            
-                        new_cargo = CargoMessage(
-                            chat_id=message.chat_id,
-                            message_id=message.id,
-                            text=text_raw,
-                            message_date=msg_date_naive
-                        )
-                        session.add(new_cargo)
-                        await session.commit()
-                        
-                        collector_stats["live_caught"] += 1
-                except Exception as e:
-                    print(f"⚠️ Ошибка в Live обработчике: {e}")
+                    seen_exact_texts.add(text_normalized)
+                    
+                    new_cargo = CargoMessage(
+                        chat_id=message.chat_id,
+                        message_id=message.id,
+                        text=text_raw,
+                        message_date=msg_date_naive
+                    )
+                    session.add(new_cargo)
+                    await session.commit()
+                    
+                    history_count += 1
+                    collector_stats["new_caught"] = history_count
+        except Exception as ex:
+            print(f"⚠️ Ошибка исторического сбора в чате {group_name}: {ex}")
 
-            while True:
-                await asyncio.sleep(60)
+    print(f"✅ Исторический сбор завершен. Загружено сообщений: {history_count}")
+
+    # --- ЭТАП 2: Непрерывный Live-режим (только новые входящие) ---
+    collector_stats["status"] = "🟢 Мониторинг в реальном времени (Live)"
+    collector_stats["current_group"] = "Слушаем поток папки «Грузы»"
+
+    @client.on(events.NewMessage(chats=target_chat_ids))
+    async def live_message_handler(event):
+        try:
+            message = event.message
+            if not message.date or not message.text:
+                return
                 
+            msg_date_naive = message.date.replace(tzinfo=None)
+            text_raw = message.text.strip()
+            text_normalized = clean_text_for_dedup(text_raw)
+            
+            if len(text_normalized) < 5:
+                return
+                
+            async with AsyncSessionLocal() as session:
+                stmt_id = select(CargoMessage).where(
+                    (CargoMessage.chat_id == message.chat_id) & (CargoMessage.message_id == message.id)
+                )
+                existing = (await session.execute(stmt_id)).scalars().first()
+                
+                if existing:
+                    collector_stats["duplicates_filtered"] += 1
+                    return
+                    
+                new_cargo = CargoMessage(
+                    chat_id=message.chat_id,
+                    message_id=message.id,
+                    text=text_raw,
+                    message_date=msg_date_naive
+                )
+                session.add(new_cargo)
+                await session.commit()
+                
+                collector_stats["live_caught"] += 1
+                print(f"📥 [Live] Сохранено новое сообщение из чата {message.chat_id}")
         except Exception as e:
-            collector_stats["status"] = f"Ошибка цикла: {e}"
-            print(f"⚠️ Ошибка в фоновом сборщике: {e}")
-            await asyncio.sleep(10)
+            print(f"⚠️ Ошибка в Live обработчике: {e}")
 
 def setup_parser(client, channels_list=None):
-    return asyncio.create_task(run_collector_loop(client, channels_list))
-
-async def parse_history_for_last_48h(client=None, channels_list=None):
-    if client:
-        setup_parser(client, channels_list)
+    return asyncio.create_task(run_collector_loop(client))
