@@ -11,9 +11,11 @@ collector_stats = {
     "total_groups": 0,
     "current_group": "Инициализация...",
     "current_group_index": 0,
+    "current_group_saved": 0,
     "new_caught": 0,
     "live_caught": 0,
     "duplicates_filtered": 0,
+    "deleted_from_db": 0,
     "status": "Запуск..."
 }
 
@@ -79,6 +81,7 @@ async def run_collector_loop(client):
         raw_title = getattr(entity, 'title', str(getattr(entity, 'username', entity.id)))
         group_name = str(raw_title.text if hasattr(raw_title, 'text') else raw_title)
         collector_stats["current_group"] = f"[{idx}/{len(channels)}] {group_name}"
+        collector_stats["current_group_saved"] = 0  # Сбрасываем счетчик для текущей группы
         
         try:
             async for message in client.iter_messages(entity, limit=3000):
@@ -122,6 +125,7 @@ async def run_collector_loop(client):
                     
                     history_count += 1
                     collector_stats["new_caught"] = history_count
+                    collector_stats["current_group_saved"] += 1
         except Exception as ex:
             print(f"⚠️ Ошибка исторического сбора в чате {group_name}: {ex}")
 
@@ -130,6 +134,7 @@ async def run_collector_loop(client):
     # --- ЭТАП 2: Непрерывный Live-режим (только новые входящие) ---
     collector_stats["status"] = "🟢 Мониторинг в реальном времени (Live)"
     collector_stats["current_group"] = "Слушаем поток папки «Грузы»"
+    collector_stats["current_group_saved"] = 0
 
     @client.on(events.NewMessage(chats=target_chat_ids))
     async def live_message_handler(event):

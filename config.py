@@ -22,4 +22,4 @@ if not DATABASE_URL:
     raise ValueError("Не задан DATABASE_URL в файле .env!")
 
     # Ссылка на базу групп из .env
-GROUP_BASE = os.getenv("GROUP_BASE", "https://t.me/addlist/C5XQr9ezmXs0OTAy")
+GROUP_BASE = os.getenv("GROUP_BASE", "https://t.me/addlist/2WPMTFBfZWM0ZTFi")
